@@ -31,14 +31,16 @@ def get_conversation_manager() -> ConversationManager:
 @router.post("/webhook/telegram")
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) -> dict:
     data = await request.json()
-    update = Update.de_json(data, get_conversation_manager()._adapter._app.bot)
+    mgr = get_conversation_manager()
+    update = Update.de_json(data, mgr._adapter._app.bot)
 
     msg = None
     if update.message:
         tg_msg = update.message
         user_id = str(tg_msg.chat_id)
         if tg_msg.location:
-            msg = IncomingMessage(user_id=user_id, text=None, lat=tg_msg.location.latitude, lng=tg_msg.location.longitude)
+            msg = IncomingMessage(user_id=user_id, text=None,
+                                  lat=tg_msg.location.latitude, lng=tg_msg.location.longitude)
         else:
             msg = IncomingMessage(user_id=user_id, text=tg_msg.text or "")
     elif update.callback_query:
@@ -48,7 +50,27 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) 
         await cb.answer()
 
     if msg:
-        background_tasks.add_task(get_conversation_manager().handle, msg)
+        background_tasks.add_task(mgr.handle, msg)
+
+    return {"ok": True}
+
+
+@router.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks,
+                           x_razorpay_signature: str = Header(default="")) -> dict:
+    body = await request.body()
+    from src.services.payment import PaymentService
+    svc = PaymentService()
+    if not svc.verify_webhook_signature(body, x_razorpay_signature):
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    data = await request.json()
+    event = data.get("event")
+
+    if event == "payment_link.paid":
+        background_tasks.add_task(_handle_payment_success, data)
+    elif event in {"payment.failed", "payment_link.expired"}:
+        background_tasks.add_task(_handle_payment_failure, data)
 
     return {"ok": True}
 
@@ -64,8 +86,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks,
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
-    # Phase 2: parse WhatsApp payload and dispatch to ConversationManager
-    logger.info("WhatsApp webhook received")
+    logger.info("WhatsApp webhook received (Phase 2)")
     return {"ok": True}
 
 
@@ -75,3 +96,43 @@ async def whatsapp_verify(request: Request) -> int:
     if params.get("hub.verify_token") == settings.whatsapp_verify_token:
         return int(params.get("hub.challenge", 0))
     raise HTTPException(status_code=403, detail="Invalid verify token")
+
+
+async def _handle_payment_success(data: dict) -> None:
+    from src.db.database import AsyncSessionLocal
+    from src.models.order import Order, OrderStatus
+    from src.services.swiggy_food import SwiggyFoodClient
+    from sqlalchemy import select
+
+    payload = data.get("payload", {})
+    reference_id = payload.get("payment_link", {}).get("entity", {}).get("reference_id")
+    if not reference_id:
+        return
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Order).where(Order.razorpay_order_id == reference_id))
+        order = result.scalar_one_or_none()
+        if not order:
+            logger.warning("Order not found for reference_id %s", reference_id)
+            return
+
+        order.status = OrderStatus.PLACED
+        await db.commit()
+        logger.info("Payment confirmed for order %s", order.id)
+
+
+async def _handle_payment_failure(data: dict) -> None:
+    payload = data.get("payload", {})
+    reference_id = payload.get("payment_link", {}).get("entity", {}).get("reference_id")
+    logger.warning("Payment failed for reference_id %s", reference_id)
+
+    from src.db.database import AsyncSessionLocal
+    from src.models.order import Order, OrderStatus
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Order).where(Order.razorpay_order_id == reference_id))
+        order = result.scalar_one_or_none()
+        if order:
+            order.status = OrderStatus.FAILED
+            await db.commit()
