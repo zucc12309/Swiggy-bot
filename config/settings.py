@@ -9,10 +9,13 @@ class Settings(BaseSettings):
     messaging_platform: str = "telegram"  # "telegram" | "whatsapp"
 
     # Database
-    database_url: str = "postgresql+asyncpg://swiggy_bot:password@localhost:5432/swiggy_bot"
+    database_url: str = "postgresql+asyncpg://swiggy_bot:changeme@localhost:5432/swiggy_bot"
 
     # Redis / Celery
     redis_url: str = "redis://localhost:6379/0"
+
+    # Payments
+    payment_callback_base_url: str = ""
 
     # Telegram
     telegram_bot_token: str = ""

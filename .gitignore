@@ -1,7 +1,11 @@
-# Environment
+# Environment — never commit these
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Python
 __pycache__/
@@ -27,7 +31,7 @@ env/
 .coverage
 htmlcov/
 
-# Alembic
+# Alembic compiled
 alembic/versions/*.pyc
 
 # Logs
@@ -37,3 +41,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Secrets & credentials
+*.secret
+credentials.json
+service_account.json

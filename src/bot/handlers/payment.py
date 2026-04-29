@@ -1,6 +1,7 @@
 import logging
 import uuid
 
+from config.settings import settings
 from src.adapters.base import Button, MessagingAdapter, OutboundMessage
 from src.services.payment import PaymentService
 from src.services.session import SessionService
@@ -22,7 +23,7 @@ async def handle_confirm_pay(user_id: str, adapter: MessagingAdapter, session: S
             amount=total,
             description=f"Swiggy {'Food' if order_type == 'food' else 'Instamart'} Order",
             order_id=idempotency_key,
-            callback_url=f"https://your-domain.com/payment/callback/{user_id}",
+            callback_url=f"{settings.payment_callback_base_url}/payment/callback/{user_id}",
         )
         await adapter.send_payment_link(
             user_id,
