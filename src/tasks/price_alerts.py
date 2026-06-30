@@ -1,5 +1,11 @@
+"""Price drop alerts — poll Instamart every 6h via search_products.
+
+Note: Instamart has no batch product-lookup tool in v1. We re-search per
+unique product_name per address. Keep alert counts modest.
+"""
 import asyncio
 import logging
+from collections import defaultdict
 
 from .celery_app import celery_app
 
@@ -16,6 +22,7 @@ async def _poll_price_alerts() -> None:
     from src.models.price_alert import PriceAlert, PriceAlertStatus
     from src.models.user import User
     from src.services.swiggy_instamart import SwiggyInstamartClient
+    from src.services import swiggy_auth
     from sqlalchemy import select
 
     client = SwiggyInstamartClient()
@@ -29,36 +36,48 @@ async def _poll_price_alerts() -> None:
         if not alerts:
             return
 
-        # Batch by product_id to minimise API calls
-        product_ids = list({a.product_id for a in alerts})
-        try:
-            products = await client.get_products_batch(product_ids)
-        except Exception:
-            logger.exception("Instamart batch fetch failed during price alert poll")
-            return
+        # Group by (telegram_id, address_id) so we batch search calls per user
+        grouped = defaultdict(list)
+        for a in alerts:
+            grouped[(a.telegram_id, a.address_id)].append(a)
 
-        price_map = {p["id"]: p["price"] for p in products}
-
-        for alert in alerts:
-            current_price = price_map.get(alert.product_id)
-            if current_price is None:
+        for (telegram_id, address_id), bucket in grouped.items():
+            user_res = await db.execute(select(User).where(User.telegram_id == telegram_id))
+            user = user_res.scalar_one_or_none()
+            if not user or not user.swiggy_access_token:
                 continue
-            if current_price <= alert.target_price:
-                await _fire_alert(alert, current_price, db)
+            if swiggy_auth.is_token_expired(user.swiggy_token_expires_at):
+                continue
+
+            for alert in bucket:
+                try:
+                    res = await client.search_products(user.swiggy_access_token,
+                                                       address_id, alert.product_name)
+                except Exception:
+                    logger.exception("search_products failed for alert %s", alert.id)
+                    continue
+
+                products = res.get("products", []) if isinstance(res, dict) else []
+                current_price = None
+                for p in products:
+                    for v in (p.get("variants") or []):
+                        if v.get("spinId") == alert.product_spin_id:
+                            current_price = v.get("price")
+                            break
+                    if current_price is not None:
+                        break
+
+                if current_price is None:
+                    continue
+                if current_price <= alert.target_price:
+                    await _fire_alert(alert, current_price, user)
 
         await db.commit()
 
 
-async def _fire_alert(alert, current_price: int, db) -> None:
+async def _fire_alert(alert, current_price: int, user) -> None:
     from src.models.price_alert import PriceAlertStatus
-    from src.models.user import User
     from src.adapters.base import Button, OutboundMessage
-    from sqlalchemy import select
-
-    user_result = await db.execute(select(User).where(User.phone == alert.user_phone))
-    user = user_result.scalar_one_or_none()
-    if not user or not user.telegram_id:
-        return
 
     savings = alert.previous_price - current_price
     alert.status = PriceAlertStatus.FIRED
@@ -77,12 +96,11 @@ async def _fire_alert(alert, current_price: int, db) -> None:
             f"🔔 *Price Drop Alert!*\n\n"
             f"*{alert.product_name}* dropped to ₹{current_price / 100:.2f}\n"
             f"Was: ₹{alert.previous_price / 100:.2f} — You save ₹{savings / 100:.2f}!",
-            [
-                [Button("🛒 Order Now", f"prod_{alert.product_id}"),
-                 Button("⏰ Remind Later", f"snooze_alert_{alert.id}")],
-            ],
+            [[Button("🛒 Order Now", f"prod_{alert.product_spin_id}"),
+              Button("⏰ Remind Later", f"snooze_alert_{alert.id}")]],
         )
         await app.shutdown()
-        logger.info("Price alert fired for %s (user %s)", alert.product_name, alert.user_phone)
+        logger.info("Price alert fired for %s (user %s)",
+                    alert.product_name, alert.telegram_id)
     except Exception:
-        logger.exception("Failed to send price alert for %s", alert.product_id)
+        logger.exception("Failed to send price alert for %s", alert.product_spin_id)

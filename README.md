@@ -9,14 +9,19 @@ A conversational commerce bot that lets users order food and groceries from Swig
 ## Features
 
 ### Phase 1 — Telegram MVP
-- **Food Ordering** — Search restaurants, browse menus, build a cart, and pay via Razorpay link — all in chat
-- **Grocery Ordering** — Search Swiggy Instamart products with unit and quantity selection
-- **Auto-Restock Schedules** — Set up recurring grocery orders with flexible frequency (daily / weekly / monthly / every Monday / 1st of every month)
+- **Swiggy OAuth Connect** — Users authorise the bot via Swiggy's own phone-OTP consent flow (OAuth 2.1 + PKCE)
+- **Food Ordering** — Search restaurants, browse menus, build a cart on Swiggy's server-side cart, place COD orders in chat
+- **Grocery Ordering** — Search Swiggy Instamart products by variant (spinId), one-tap reorder via `your_go_to_items`
+- **Auto-Restock Schedules** — Recurring Instamart orders with flexible frequency (daily / weekly / monthly / every Monday / 1st of every month)
 - **Multiple Schedules** — Up to 10 named schedules per user, each on its own cadence
 - **Pre-Order Reminders** — Configurable reminder N hours before each scheduled order with OK / Edit / Skip / Pause options
 - **Schedule Controls** — Skip, Pause, Resume, Cancel, or Delay any schedule at any time
 - **Order History** — View last 5 orders with live status
-- **Razorpay Payments** — UPI, cards, net banking, and wallets via inline payment links
+
+#### v1 constraints (Swiggy Builders Club)
+- **COD only** — Swiggy MCP doesn't accept online payment in v1
+- **₹1000 cart cap** on Food orders (configurable per-user auto-charge cap also defaults to ₹1000)
+- **OAuth tokens last 5 days** — re-authorise on expiry (no refresh tokens in v1.0)
 
 ### Phase 2 — WhatsApp + Enrichment
 - WhatsApp channel via Meta Cloud API (WABA approval in progress)
@@ -39,7 +44,7 @@ A conversational commerce bot that lets users order food and groceries from Swig
 | Database | PostgreSQL + SQLAlchemy (async) |
 | Migrations | Alembic |
 | Session Cache | Redis (30-min TTL) |
-| Payments | Razorpay (Phase 1) + WhatsApp Pay (Phase 2) |
+| Payments | Swiggy MCP is COD-only in v1 — no PSP integration |
 | Swiggy APIs | Builders Club MCP (Food, Instamart, Dineout) |
 | Infrastructure | AWS EC2 + RDS |
 

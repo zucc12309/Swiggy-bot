@@ -1,3 +1,8 @@
+"""Conversation state machine — Swiggy MCP OAuth-aware.
+
+States: IDLE, ONBOARDING, FOOD_ORDER, GROCERY_ORDER, SCHEDULE_CREATE,
+SCHEDULE_EDIT, DINEOUT, PAYMENT_PENDING.
+"""
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -10,14 +15,12 @@ logger = logging.getLogger(__name__)
 
 CANCEL_PHRASES = {"cancel", "/cancel", "stop", "quit", "exit"}
 FOOD_TRIGGERS = {"order food", "food", "hungry", "eat", "restaurant", "biryani", "pizza", "burger"}
-GROCERY_TRIGGERS = {"order groceries", "groceries", "instamart", "grocery", "get milk", "vegetables"}
-SCHEDULE_TRIGGERS = {"auto restock", "schedule", "auto-restock", "set up restock", "create schedule", "restock"}
+GROCERY_TRIGGERS = {"order groceries", "groceries", "instamart", "grocery", "milk", "vegetables"}
+SCHEDULE_TRIGGERS = {"auto restock", "schedule", "auto-restock", "set up restock",
+                     "create schedule", "restock"}
+DINEOUT_TRIGGERS = {"book a table", "reservation", "dine out", "book table"}
 
-MAIN_MENU_BUTTONS = [
-    [Button("🍔 Order Food", "order_food"), Button("🛒 Order Groceries", "order_grocery")],
-    [Button("🔄 My Schedules", "schedules"), Button("📦 My Orders", "my_orders")],
-    [Button("⚙️ Settings", "settings"), Button("❓ Help", "help")],
-]
+MAIN_MENU_BUTTONS = onboarding.MAIN_MENU_BUTTONS
 
 
 @dataclass
@@ -40,7 +43,7 @@ class ConversationManager:
         except Exception:
             logger.exception("Unhandled error for user %s", msg.user_id)
             await self._adapter.send_message(msg.user_id, OutboundMessage(
-                text="⚠️ Something went wrong. Please try again or type /menu to return to the main menu."
+                text="⚠️ Something went wrong. Type /menu to return to the main menu."
             ))
 
     async def _dispatch(self, msg: IncomingMessage) -> None:
@@ -59,8 +62,8 @@ class ConversationManager:
 
         # Global commands
         if text_lower in {"/start", "start", "hi", "hello"}:
-            sess = await self._session.get(user_id)
-            await onboarding.handle_start(user_id, self._adapter, self._session, sess or {})
+            user_data = await self._load_user_flags(user_id)
+            await onboarding.handle_start(user_id, self._adapter, self._session, user_data)
             return
 
         if text_lower in {"/menu", "menu", "main menu"}:
@@ -83,7 +86,7 @@ class ConversationManager:
             await self._send_settings(user_id)
             return
 
-        # Callback routing (platform-agnostic)
+        # Callback routing
         if cb:
             await self._handle_callback(user_id, cb, state)
             return
@@ -92,7 +95,11 @@ class ConversationManager:
         if state == "ONBOARDING":
             await self._handle_onboarding(msg, text)
         elif state == "FOOD_ORDER":
-            await food_order.handle_food_search(user_id, text, self._adapter, self._session)
+            sess = await self._session.get(user_id)
+            if (sess or {}).get("restaurant_id"):
+                await food_order.handle_dish_search(user_id, text, self._adapter, self._session)
+            else:
+                await food_order.handle_food_search(user_id, text, self._adapter, self._session)
         elif state == "GROCERY_ORDER":
             await grocery_order.handle_grocery_message(user_id, text, self._adapter, self._session)
         elif state == "SCHEDULE_CREATE":
@@ -101,7 +108,7 @@ class ConversationManager:
             await self._handle_schedule_edit(text, user_id)
         elif state == "PAYMENT_PENDING":
             await self._adapter.send_message(user_id, OutboundMessage(
-                text="⏳ Waiting for payment. Complete the payment via the link above, or type /cancel to exit."
+                text="⏳ Waiting on your confirmation — tap *Place Order* or /cancel."
             ))
         else:
             await self._handle_idle(user_id, text_lower)
@@ -111,12 +118,13 @@ class ConversationManager:
         if cb == "order_food":
             await self._session.update(user_id, {"state": "FOOD_ORDER"})
             await self._adapter.send_message(user_id, OutboundMessage(
-                text="🍔 What are you in the mood for? (e.g. *biryani*, *pizza*, *South Indian*)"
+                text="🍔 What are you in the mood for? (e.g. *biryani*, *pizza*)"
             ))
         elif cb == "order_grocery":
-            await self._session.update(user_id, {"state": "GROCERY_ORDER", "step": "search", "grocery_cart": []})
+            await grocery_order.handle_grocery_start(user_id, "", self._adapter, self._session)
+        elif cb == "book_table":
             await self._adapter.send_message(user_id, OutboundMessage(
-                text="🛒 What would you like to order? (e.g. *milk*, *tomatoes*, *rice*)"
+                text="🪑 Dineout reservations coming in Phase 2!"
             ))
         elif cb == "schedules":
             await schedules.handle_list_schedules(user_id, self._adapter, self._session)
@@ -127,31 +135,37 @@ class ConversationManager:
         elif cb == "help":
             await self._send_help(user_id)
 
-        # Food order callbacks
+        # Onboarding
+        elif cb.startswith("pick_addr_"):
+            await onboarding.handle_address_pick(user_id, int(cb[10:]),
+                                                 self._adapter, self._session)
+
+        # Food
         elif cb.startswith("rest_"):
-            await food_order.handle_restaurant_select(cb[5:], cb[5:], self._adapter, self._session)
-        elif cb.startswith("cat_"):
-            await food_order.handle_category_select(user_id, cb[4:], self._adapter, self._session)
-        elif cb.startswith("item_"):
-            await food_order.handle_item_add(user_id, cb[5:], self._adapter, self._session)
+            await food_order.handle_restaurant_select(user_id, cb[5:],
+                                                      self._adapter, self._session)
+        elif cb.startswith("additem_"):
+            await food_order.handle_item_add(user_id, cb[8:], self._adapter, self._session)
         elif cb == "checkout":
             await food_order.handle_checkout(user_id, self._adapter, self._session)
-        elif cb == "edit_cart":
-            await food_order.handle_edit_cart(user_id, self._adapter, self._session)
-        elif cb.startswith("remove_item_"):
-            await food_order.handle_remove_item(user_id, cb[12:], self._adapter, self._session)
+        elif cb == "add_more":
+            await self._adapter.send_message(user_id, OutboundMessage(
+                text="What else? Type a dish name to search."
+            ))
+        elif cb == "flush_cart":
+            await food_order.handle_flush_cart(user_id, self._adapter, self._session)
 
-        # Grocery callbacks
-        elif cb.startswith("prod_"):
-            await grocery_order.handle_grocery_callback(user_id, cb, self._adapter, self._session)
-        elif cb.startswith("unit_") or cb in {"grocery_checkout", "grocery_more", "edit_grocery_cart"}:
+        # Grocery
+        elif cb.startswith(("prod_", "variant_", "goto_")) or cb in {
+            "grocery_search_more", "grocery_checkout", "grocery_clear"
+        }:
             await grocery_order.handle_grocery_callback(user_id, cb, self._adapter, self._session)
 
         # Payment
         elif cb == "confirm_pay":
             await payment.handle_confirm_pay(user_id, self._adapter, self._session)
 
-        # Schedule callbacks
+        # Schedule
         elif cb == "confirm_schedule":
             await self._save_schedule(user_id)
         elif cb == "cancel_schedule":
@@ -160,42 +174,33 @@ class ConversationManager:
         elif cb == "edit_items_again":
             await self._session.update(user_id, {"step": "items"})
             sess = await self._session.get(user_id)
-            items = sess.get("schedule_items", [])
+            items = (sess or {}).get("schedule_items", [])
             await self._adapter.send_message(user_id, OutboundMessage(
-                text=f"Current items: {', '.join(i['name'] for i in items)}\n\nAdd more or type *done*."
+                text=f"Current items: {', '.join(i['name'] for i in items)}\n\n"
+                     f"Add more or type *done*."
             ))
         elif cb.startswith("edit_sched_"):
-            schedule_id = int(cb.split("_")[2])
-            await schedules.handle_schedule_edit_start(user_id, schedule_id, self._adapter, self._session)
+            await schedules.handle_schedule_edit_start(user_id, int(cb.split("_")[2]),
+                                                       self._adapter, self._session)
         elif cb == "sched_pause":
             await schedules.handle_schedule_control(user_id, "pause", self._adapter, self._session)
         elif cb == "sched_cancel":
             await schedules.handle_schedule_control(user_id, "cancel", self._adapter, self._session)
 
-        # Reminder response callbacks
-        elif cb.startswith("remind_ok_"):
-            schedule_id = int(cb.split("_")[2])
-            await schedules.handle_reminder_response(user_id, "ok", schedule_id, self._adapter, self._session)
-        elif cb.startswith("remind_skip_"):
-            schedule_id = int(cb.split("_")[2])
-            await schedules.handle_reminder_response(user_id, "skip", schedule_id, self._adapter, self._session)
-        elif cb.startswith("remind_pause_"):
-            schedule_id = int(cb.split("_")[2])
-            await schedules.handle_reminder_response(user_id, "pause", schedule_id, self._adapter, self._session)
-        elif cb.startswith("remind_edit_"):
-            schedule_id = int(cb.split("_")[2])
-            await schedules.handle_reminder_response(user_id, "edit", schedule_id, self._adapter, self._session)
+        # Reminder responses
+        elif cb.startswith(("remind_ok_", "remind_skip_", "remind_pause_", "remind_edit_")):
+            action = cb.split("_")[1]
+            schedule_id = int(cb.rsplit("_", 1)[1])
+            await schedules.handle_reminder_response(user_id, action, schedule_id,
+                                                     self._adapter, self._session)
 
     async def _handle_onboarding(self, msg: IncomingMessage, text: str) -> None:
-        sess = await self._session.get(msg.user_id)
-        step = (sess or {}).get("step")
-        if step == "location" and msg.lat is not None:
-            await onboarding.handle_location(msg.user_id, msg.lat, msg.lng,
-                                             self._adapter, self._session)
-        elif step == "phone":
-            await onboarding.handle_phone_otp(msg.user_id, text, self._adapter, self._session)
-        elif step == "otp":
-            await onboarding.complete_onboarding(msg.user_id, self._adapter, self._session)
+        # We no longer collect phone/location/OTP — Swiggy's OAuth UI does that.
+        # If the user types here mid-flow, just remind them to open the link.
+        await self._adapter.send_message(msg.user_id, OutboundMessage(
+            text="⏳ Waiting for you to connect Swiggy in your browser. "
+                 "Open the link I sent, or type /start to restart."
+        ))
 
     async def _handle_schedule_create(self, text: str, user_id: str) -> None:
         sess = await self._session.get(user_id)
@@ -223,64 +228,57 @@ class ConversationManager:
             await self._delay_schedule(user_id, days)
 
     async def _delay_schedule(self, user_id: str, days: int) -> None:
+        from datetime import timedelta
         from src.db.database import AsyncSessionLocal
         from src.models.schedule import Schedule
         sess = await self._session.get(user_id)
         schedule_id = (sess or {}).get("editing_schedule_id")
         if not schedule_id:
             return
-        from datetime import timedelta
         async with AsyncSessionLocal() as db:
             sched = await db.get(Schedule, schedule_id)
             if sched:
                 sched.next_run = sched.next_run + timedelta(days=days)
                 await db.commit()
                 await self._adapter.send_message(user_id, OutboundMessage(
-                    text=f"⏩ Next run delayed by {days} day(s). New date: {sched.next_run.strftime('%d %b %Y')}."
+                    text=f"⏩ Next run delayed by {days} day(s). "
+                         f"New date: {sched.next_run.strftime('%d %b %Y')}."
                 ))
 
     async def _save_schedule(self, user_id: str) -> None:
+        from datetime import datetime
         from src.db.database import AsyncSessionLocal
         from src.models.schedule import Schedule, ScheduleItem, FrequencyUnit
-        from datetime import datetime
 
-        sess = await self._session.get(user_id)
-        phone = (sess or {}).get("phone", user_id)
-        name = (sess or {}).get("schedule_name", "My Schedule")
-        freq_value = (sess or {}).get("freq_value", 1)
-        freq_unit = (sess or {}).get("freq_unit", "weeks")
-        anchor_day = (sess or {}).get("anchor_day")
-        next_run_str = (sess or {}).get("next_run")
-        items = (sess or {}).get("schedule_items", [])
-        next_run = datetime.fromisoformat(next_run_str) if next_run_str else datetime.now()
-
+        sess = await self._session.get(user_id) or {}
         async with AsyncSessionLocal() as db:
             schedule = Schedule(
-                user_phone=phone,
-                name=name,
-                freq_value=freq_value,
-                freq_unit=FrequencyUnit(freq_unit),
-                anchor_day=anchor_day,
-                next_run=next_run,
+                telegram_id=user_id,
+                name=sess.get("schedule_name", "My Schedule"),
+                freq_value=sess.get("freq_value", 1),
+                freq_unit=FrequencyUnit(sess.get("freq_unit", "weeks")),
+                anchor_day=sess.get("anchor_day"),
+                next_run=datetime.fromisoformat(sess["next_run"]) if sess.get("next_run") else datetime.utcnow(),
             )
             db.add(schedule)
             await db.flush()
-            for item in items:
+            for item in sess.get("schedule_items", []):
                 db.add(ScheduleItem(
                     schedule_id=schedule.id,
-                    item_id=item.get("id", item["name"]),
+                    item_id=item.get("spin_id") or item.get("id") or item["name"],
                     name=item["name"],
                     quantity=item.get("qty", 1),
                     unit=item.get("unit", "pcs"),
                 ))
             await db.commit()
+            sched_name = schedule.name
+            next_run = schedule.next_run
 
         await self._session.update(user_id, {"state": "IDLE"})
         await self._adapter.send_message(user_id, OutboundMessage(
-            text=f"✅ *{name}* saved! Your first order will be placed on "
+            text=f"✅ *{sched_name}* saved! First order: "
                  f"{next_run.strftime('%d %b %Y')}.\n\n"
-                 f"You'll get a reminder {(sess or {}).get('reminder_lead_hours', 12)} hours before. "
-                 f"Use /schedules to view or edit it anytime."
+                 f"You'll get a reminder 12 hours before. Use /schedules to manage it."
         ))
 
     async def _handle_idle(self, user_id: str, text_lower: str) -> None:
@@ -288,10 +286,13 @@ class ConversationManager:
             await self._session.update(user_id, {"state": "FOOD_ORDER"})
             await food_order.handle_food_search(user_id, text_lower, self._adapter, self._session)
         elif any(t in text_lower for t in GROCERY_TRIGGERS):
-            await self._session.update(user_id, {"state": "GROCERY_ORDER", "step": "search", "grocery_cart": []})
             await grocery_order.handle_grocery_start(user_id, text_lower, self._adapter, self._session)
         elif any(t in text_lower for t in SCHEDULE_TRIGGERS):
             await schedules.handle_create_schedule_start(user_id, self._adapter, self._session)
+        elif any(t in text_lower for t in DINEOUT_TRIGGERS):
+            await self._adapter.send_message(user_id, OutboundMessage(
+                text="🪑 Dineout reservations coming in Phase 2!"
+            ))
         else:
             await self._adapter.send_buttons(
                 user_id,
@@ -299,28 +300,44 @@ class ConversationManager:
                 MAIN_MENU_BUTTONS,
             )
 
+    async def _load_user_flags(self, user_id: str) -> dict:
+        from src.db.database import AsyncSessionLocal
+        from src.models.user import User
+        from src.services import swiggy_auth
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(User).where(User.telegram_id == user_id))
+            user = result.scalar_one_or_none()
+            if not user:
+                return {}
+            authed = (user.swiggy_access_token
+                      and not swiggy_auth.is_token_expired(user.swiggy_token_expires_at))
+            return {"swiggy_authenticated": authed}
+
     async def _handle_my_orders(self, user_id: str) -> None:
         from src.db.database import AsyncSessionLocal
         from src.models.order import Order
         from sqlalchemy import select, desc
 
-        sess = await self._session.get(user_id)
-        phone = (sess or {}).get("phone", user_id)
         async with AsyncSessionLocal() as db:
             result = await db.execute(
-                select(Order).where(Order.user_phone == phone).order_by(desc(Order.created_at)).limit(5)
+                select(Order).where(Order.telegram_id == user_id)
+                .order_by(desc(Order.created_at)).limit(5)
             )
             orders = result.scalars().all()
 
         if not orders:
-            await self._adapter.send_message(user_id, OutboundMessage(text="You have no orders yet."))
+            await self._adapter.send_message(user_id, OutboundMessage(text="No orders yet."))
             return
 
         lines = []
         for o in orders:
-            status_emoji = {"delivered": "✅", "placed": "🔄", "confirmed": "🔄",
-                            "picked_up": "🛵", "cancelled": "❌", "failed": "❌"}.get(o.status.value, "⏳")
-            lines.append(f"{status_emoji} *{o.type.value.title()}* — ₹{o.total / 100:.0f} — {o.created_at.strftime('%d %b %H:%M')}")
+            emoji = {"delivered": "✅", "placed": "🔄", "confirmed": "🔄",
+                     "picked_up": "🛵", "cancelled": "❌", "failed": "❌"}.get(
+                o.status.value, "⏳")
+            lines.append(f"{emoji} *{o.type.value.title()}* — ₹{o.total / 100:.0f} — "
+                        f"{o.created_at.strftime('%d %b %H:%M')}")
 
         await self._adapter.send_message(user_id, OutboundMessage(
             text="📦 *Recent Orders*\n\n" + "\n".join(lines)
@@ -329,26 +346,23 @@ class ConversationManager:
     async def _send_help(self, user_id: str) -> None:
         await self._adapter.send_message(user_id, OutboundMessage(
             text="❓ *Help*\n\n"
-                 "/start — Return to main menu\n"
+                 "/start — Connect Swiggy or return to menu\n"
                  "/menu — Show all options\n"
                  "/orders — View recent orders\n"
-                 "/schedules — Manage auto-restock schedules\n"
-                 "/settings — Update address, reminders, budget\n"
+                 "/schedules — Manage auto-restock\n"
+                 "/settings — Address, reminders, budget\n"
                  "/cancel — Exit current flow\n\n"
-                 "Or just type what you want:\n"
-                 "• *order food* — Search restaurants\n"
-                 "• *order groceries* — Shop on Instamart\n"
-                 "• *auto restock* — Set up a recurring order\n"
-                 "• *my orders* — View order history"
+                 "Or just type — *order food*, *order groceries*, *auto restock*, *book a table*.\n\n"
+                 "Note: COD only in v1. Food orders capped at ₹1000."
         ))
 
     async def _send_settings(self, user_id: str) -> None:
         await self._adapter.send_buttons(
-            user_id,
-            "⚙️ *Settings*",
+            user_id, "⚙️ *Settings*",
             [
-                [Button("📍 Update Address", "update_address")],
+                [Button("📍 Change Address", "update_address")],
                 [Button("⏰ Reminder Timing", "update_reminder")],
-                [Button("💳 Payment Method", "update_payment")],
+                [Button("💰 Auto-charge Cap", "update_cap")],
+                [Button("📊 Monthly Budget", "update_budget")],
             ],
         )

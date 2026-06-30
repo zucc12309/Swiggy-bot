@@ -172,10 +172,8 @@ async def handle_list_schedules(user_id: str, adapter: MessagingAdapter,
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as db:
-        sess_db = await session.get(user_id)
-        phone = (sess_db or {}).get("phone", user_id)
         result = await db.execute(
-            select(Schedule).where(Schedule.user_phone == phone,
+            select(Schedule).where(Schedule.telegram_id == user_id,
                                    Schedule.status == ScheduleStatus.ACTIVE)
         )
         schedules = result.scalars().all()

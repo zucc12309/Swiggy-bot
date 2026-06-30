@@ -43,7 +43,7 @@ async def _check_due_reminders() -> None:
         schedules = result.scalars().all()
 
         for sched in schedules:
-            user_result = await db.execute(select(User).where(User.phone == sched.user_phone))
+            user_result = await db.execute(select(User).where(User.telegram_id == sched.telegram_id))
             user = user_result.scalar_one_or_none()
             if not user:
                 continue
@@ -68,7 +68,7 @@ async def _send_reminder(schedule_id: int) -> None:
         if not schedule or schedule.status != ScheduleStatus.ACTIVE:
             return
 
-        user_result = await db.execute(select(User).where(User.phone == schedule.user_phone))
+        user_result = await db.execute(select(User).where(User.telegram_id == schedule.telegram_id))
         user = user_result.scalar_one_or_none()
         if not user or not user.telegram_id:
             return
@@ -101,7 +101,7 @@ async def _send_reminder(schedule_id: int) -> None:
         )
         await app.shutdown()
 
-    logger.info("Reminder sent for schedule %s (user %s)", schedule.name, schedule.user_phone)
+    logger.info("Reminder sent for schedule %s (user %s)", schedule.name, schedule.telegram_id)
 
 
 async def _send_weekly_summaries() -> None:
@@ -125,7 +125,7 @@ async def _send_weekly_summaries() -> None:
 
             orders_result = await db.execute(
                 select(Order).where(
-                    Order.user_phone == user.phone,
+                    Order.telegram_id == user.telegram_id,
                     Order.created_at >= week_ago,
                     Order.status.in_(["delivered", "confirmed", "placed"]),
                 )

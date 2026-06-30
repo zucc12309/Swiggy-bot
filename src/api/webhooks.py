@@ -3,6 +3,7 @@ import hmac
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from telegram import Update
 from telegram.ext import Application
 
@@ -55,24 +56,62 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks) 
     return {"ok": True}
 
 
-@router.post("/webhook/razorpay")
-async def razorpay_webhook(request: Request, background_tasks: BackgroundTasks,
-                           x_razorpay_signature: str = Header(default="")) -> dict:
-    body = await request.body()
-    from src.services.payment import PaymentService
-    svc = PaymentService()
-    if not svc.verify_webhook_signature(body, x_razorpay_signature):
-        raise HTTPException(status_code=403, detail="Invalid signature")
+@router.get("/auth/swiggy/callback", response_class=HTMLResponse)
+async def swiggy_oauth_callback(request: Request, code: str = "", state: str = "",
+                                error: str = "") -> str:
+    """Receive Swiggy OAuth code, exchange for access token, store on user."""
+    from src.db.database import AsyncSessionLocal
+    from src.models.user import User
+    from src.services import swiggy_auth
+    from sqlalchemy import select
 
-    data = await request.json()
-    event = data.get("event")
+    if error:
+        return f"<h1>Connection failed</h1><p>{error}</p><p>Return to the bot and type /start.</p>"
 
-    if event == "payment_link.paid":
-        background_tasks.add_task(_handle_payment_success, data)
-    elif event in {"payment.failed", "payment_link.expired"}:
-        background_tasks.add_task(_handle_payment_failure, data)
+    if not code or not state or ":" not in state:
+        raise HTTPException(status_code=400, detail="missing code or state")
 
-    return {"ok": True}
+    telegram_id = state.split(":", 1)[0]
+    session = SessionService()
+    sess = await session.get(telegram_id)
+    if not sess or sess.get("oauth_state") != state:
+        raise HTTPException(status_code=400, detail="state mismatch — possible CSRF")
+
+    verifier = sess.get("oauth_verifier")
+    if not verifier:
+        raise HTTPException(status_code=400, detail="no PKCE verifier in session")
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.telegram_id == telegram_id))
+        user = result.scalar_one_or_none()
+        if not user or not user.swiggy_oauth_client_id:
+            raise HTTPException(status_code=400, detail="user not found")
+
+        try:
+            token_resp = await swiggy_auth.exchange_code(
+                code, verifier, user.swiggy_oauth_client_id,
+                settings.swiggy_oauth_redirect_uri,
+            )
+        except Exception:
+            logger.exception("token exchange failed for user %s", telegram_id)
+            return "<h1>Connection failed</h1><p>Couldn't exchange the code for a token. Please try /start again.</p>"
+
+        user.swiggy_access_token = token_resp["access_token"]
+        user.swiggy_token_expires_at = swiggy_auth.calc_expires_at(token_resp.get("expires_in", 432000))
+        await db.commit()
+
+    # Clear the verifier from session and notify the bot
+    await session.update(telegram_id, {"oauth_verifier": None, "oauth_state": None})
+
+    from src.bot.handlers import onboarding
+    mgr = get_conversation_manager()
+    try:
+        await onboarding.complete_onboarding_after_oauth(telegram_id, mgr._adapter, session)
+    except Exception:
+        logger.exception("completing onboarding failed")
+
+    return ("<h1>✅ Connected!</h1>"
+            "<p>You can close this tab and return to Telegram.</p>")
 
 
 @router.post("/webhook/whatsapp")
@@ -96,43 +135,3 @@ async def whatsapp_verify(request: Request) -> int:
     if params.get("hub.verify_token") == settings.whatsapp_verify_token:
         return int(params.get("hub.challenge", 0))
     raise HTTPException(status_code=403, detail="Invalid verify token")
-
-
-async def _handle_payment_success(data: dict) -> None:
-    from src.db.database import AsyncSessionLocal
-    from src.models.order import Order, OrderStatus
-    from src.services.swiggy_food import SwiggyFoodClient
-    from sqlalchemy import select
-
-    payload = data.get("payload", {})
-    reference_id = payload.get("payment_link", {}).get("entity", {}).get("reference_id")
-    if not reference_id:
-        return
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Order).where(Order.razorpay_order_id == reference_id))
-        order = result.scalar_one_or_none()
-        if not order:
-            logger.warning("Order not found for reference_id %s", reference_id)
-            return
-
-        order.status = OrderStatus.PLACED
-        await db.commit()
-        logger.info("Payment confirmed for order %s", order.id)
-
-
-async def _handle_payment_failure(data: dict) -> None:
-    payload = data.get("payload", {})
-    reference_id = payload.get("payment_link", {}).get("entity", {}).get("reference_id")
-    logger.warning("Payment failed for reference_id %s", reference_id)
-
-    from src.db.database import AsyncSessionLocal
-    from src.models.order import Order, OrderStatus
-    from sqlalchemy import select
-
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Order).where(Order.razorpay_order_id == reference_id))
-        order = result.scalar_one_or_none()
-        if order:
-            order.status = OrderStatus.FAILED
-            await db.commit()
